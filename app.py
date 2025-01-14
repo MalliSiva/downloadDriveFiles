@@ -13,7 +13,7 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "1234")
 # Google OAuth Configuration
 CLIENT_SECRETS_FILE = "credentials.json"
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-REDIRECT_URI = os.environ.get("REDIRECT_URI", "http://downloaddrivefiles.onrender.com/callback")
+REDIRECT_URI = os.environ.get("REDIRECT_URI", "https://downloaddrivefiles.onrender.com/callback")
 
 # AWS S3 Configuration
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "monarchsongs")
