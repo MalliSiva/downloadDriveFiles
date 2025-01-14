@@ -24,7 +24,7 @@ s3_client = boto3.client('s3')
 @app.route("/authorize")
 def authorize():
     flow = Flow.from_client_secrets_file(
-        GOOGLE_CLIENT_SECRETS_FILE,
+        CLIENT_SECRETS_FILE,
         scopes=SCOPES,
         redirect_uri="https://downloaddrivefiles.onrender.com/callback"
     )
