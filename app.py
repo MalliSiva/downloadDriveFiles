@@ -8,7 +8,7 @@ import boto3
 
 # Flask app configuration
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "1234")
+app.secret_key = os.urandom(24)  # Ensure this is set securely in production
 
 # Google OAuth Configuration
 CLIENT_SECRETS_FILE = "credentials.json"
@@ -21,47 +21,42 @@ s3_client = boto3.client('s3')
 
 
 # Route to start Google OAuth process
-@app.route('/authorize', methods=['GET'])
+@app.route("/authorize")
 def authorize():
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
+        GOOGLE_CLIENT_SECRETS_FILE,
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI
+        redirect_uri="https://downloaddrivefiles.onrender.com/callback"
     )
     authorization_url, state = flow.authorization_url(
-        access_type='offline',
-        include_granted_scopes='true'
+        access_type="offline",
+        include_granted_scopes="true"
     )
-    session['state'] = state
-    return jsonify({"authorization_url": authorization_url})
+    session['state'] = state  # Save the state in the session
+    return {"url": authorization_url}
 
 
 # Callback route after Google authorization
-@app.route('/callback', methods=['GET'])
+@app.route("/callback")
 def callback():
-    state = session.get('state')
+    state = session.get('state')  # Retrieve the state from the session
     if not state:
-        return jsonify({"error": "State missing or expired."}), 400
+        return {"error": "State missing or expired."}, 400
 
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
+        GOOGLE_CLIENT_SECRETS_FILE,
         scopes=SCOPES,
-        state=state,
-        redirect_uri=REDIRECT_URI
+        redirect_uri="https://downloaddrivefiles.onrender.com/callback",
+        state=state
     )
     flow.fetch_token(authorization_response=request.url)
 
+    # Get the credentials and save them as token.json
     credentials = flow.credentials
-    session['credentials'] = {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': credentials.scopes
-    }
+    with open("token.json", "w") as token_file:
+        token_file.write(credentials.to_json())
+    return {"message": "Authentication successful."}
 
-    return jsonify({"message": "Authorization successful!"})
 
 
 # Helper function to authenticate Google Drive service
