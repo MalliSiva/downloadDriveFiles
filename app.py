@@ -1,146 +1,121 @@
-from flask import Flask, request, jsonify, redirect, session
-from google_auth_oauthlib.flow import Flow
+from flask import Flask, request, jsonify
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+import boto3
 import os
 import io
-import boto3
 
-# Flask app configuration
 app = Flask(__name__)
-app.secret_key = os.urandom(24)  # Ensure this is set securely in production
-
-# Google OAuth Configuration
-CLIENT_SECRETS_FILE = "credentials.json"
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-REDIRECT_URI = os.environ.get("REDIRECT_URI", "https://downloaddrivefiles.onrender.com/callback")
 
 # AWS S3 Configuration
-S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "monarchsongs")
-s3_client = boto3.client('s3')
+AWS_ACCESS_KEY = "AKIAYS2NXHWN5VAG4MRF"
+AWS_SECRET_KEY = "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"
+AWS_REGION = "us-east-1"
+AWS_BUCKET_NAME = "songsuploadmonarrch"
 
-
-# Route to start Google OAuth process
-@app.route("/authorize")
-def authorize():
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri="https://downloaddrivefiles.onrender.com/callback"
-    )
-    authorization_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true"
-    )
-    session['state'] = state  # Save the state in the session
-    return {"url": authorization_url}
-
-
-# Callback route after Google authorization
-@app.route("/callback")
-def callback():
-    state = session.get('state')  # Retrieve the state from the session
-    if not state:
-        return {"error": "State missing or expired."}, 400
-
-    flow = Flow.from_client_secrets_file(
-        GOOGLE_CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri="https://downloaddrivefiles.onrender.com/callback",
-        state=state
-    )
-    flow.fetch_token(authorization_response=request.url)
-
-    # Get the credentials and save them as token.json
-    credentials = flow.credentials
-    with open("token.json", "w") as token_file:
-        token_file.write(credentials.to_json())
-    return {"message": "Authentication successful."}
-
-
-
-# Helper function to authenticate Google Drive service
+# Authenticate and create Google Drive service
 def authenticate_google_drive():
-    if 'credentials' not in session:
-        raise Exception("User not authenticated")
+    SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+    creds = None
 
-    creds_data = session['credentials']
-    credentials = Credentials(
-        creds_data['token'],
-        refresh_token=creds_data.get('refresh_token'),
-        token_uri=creds_data['token_uri'],
-        client_id=creds_data['client_id'],
-        client_secret=creds_data['client_secret'],
-        scopes=creds_data['scopes']
-    )
+    # Check for existing token.json
+    if os.path.exists('token.json'):
+        try:
+            creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        except Exception as e:
+            print(f"Error loading token.json: {e}")
+            creds = None
 
-    return build('drive', 'v3', credentials=credentials)
+    # If no valid credentials, perform a new login flow
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())  # Refresh the token
+                print("Token refreshed successfully.")
+            except Exception as e:
+                print(f"Token refresh failed: {e}. Starting re-authentication...")
+                creds = None
 
+        if not creds:
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=8080)
 
-# Route to fetch audio files from Google Drive folder
+            # Save the credentials to token.json
+            with open('token.json', 'w') as token_file:
+                token_file.write(creds.to_json())
+
+    return build('drive', 'v3', credentials=creds)
+
+# Fetch files in a Google Drive folder
+def fetch_files_from_folder(folder_id, service):
+    query = f"'{folder_id}' in parents and mimeType contains 'audio/'"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get('files', [])
+    return files
+
+# Upload a file to S3
+def upload_to_s3(file_stream, file_name):
+    try:
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=AWS_ACCESS_KEY,
+            aws_secret_access_key=AWS_SECRET_KEY,
+            region_name=AWS_REGION,
+        )
+        s3_client.upload_fileobj(file_stream, AWS_BUCKET_NAME, file_name)
+        file_url = f"https://{AWS_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{file_name}"
+        return file_url
+    except Exception as e:
+        print(f"Error uploading to S3: {e}")
+        raise
+
+# Download a file from Google Drive and upload it to S3
+def download_and_upload(file_id, file_name, service):
+    request = service.files().get_media(fileId=file_id)
+    file_stream = io.BytesIO()
+    downloader = MediaIoBaseDownload(file_stream, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    file_stream.seek(0)  # Reset stream position for upload
+    return upload_to_s3(file_stream, file_name)
+
+# Flask Routes
 @app.route('/fetch-files', methods=['POST'])
 def fetch_files():
     try:
-        folder_id = request.json.get("folder_id")
+        data = request.json
+        folder_id = data.get('folder_id')
         if not folder_id:
-            return jsonify({"error": "folder_id is required"}), 400
+            return jsonify({'error': 'Folder ID is required'}), 400
 
         service = authenticate_google_drive()
-        query = f"'{folder_id}' in parents and mimeType contains 'audio/'"
-        results = service.files().list(q=query, fields="files(id, name)").execute()
-        files = results.get('files', [])
-
-        return jsonify({"files": files})
+        files = fetch_files_from_folder(folder_id, service)
+        return jsonify({'files': files}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
-
-# Route to download a file from Google Drive and upload to S3
-@app.route('/download-and-upload', methods=['POST'])
-def download_and_upload():
+@app.route('/upload-to-s3', methods=['POST'])
+def upload():
     try:
-        file_id = request.json.get("file_id")
-        file_name = request.json.get("file_name")
+        data = request.json
+        file_id = data.get('file_id')
+        file_name = data.get('file_name')
         if not file_id or not file_name:
-            return jsonify({"error": "file_id and file_name are required"}), 400
+            return jsonify({'error': 'File ID and File Name are required'}), 400
 
         service = authenticate_google_drive()
-
-        # Download file from Google Drive
-        request_drive = service.files().get_media(fileId=file_id)
-        file_data = io.BytesIO()
-        downloader = MediaIoBaseDownload(file_data, request_drive)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-
-        # Reset buffer position to the start
-        file_data.seek(0)
-
-        # Upload to S3
-        s3_client.upload_fileobj(file_data, S3_BUCKET, file_name)
-        s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{file_name}"
-
-        return jsonify({"message": "File uploaded to S3", "s3_url": s3_url})
+        file_url = download_and_upload(file_id, file_name, service)
+        return jsonify({'message': 'File uploaded successfully', 'file_url': file_url}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
+@app.route('/')
+def index():
+    return jsonify({'message': 'Google Drive to S3 API is running'}), 200
 
-# Route to check if user is authenticated
-@app.route('/is-authenticated', methods=['GET'])
-def is_authenticated():
-    if 'credentials' in session:
-        return jsonify({"authenticated": True})
-    return jsonify({"authenticated": False})
-
-
-# Logout and clear session
-@app.route('/logout', methods=['POST'])
-def logout():
-    session.clear()
-    return jsonify({"message": "Logged out successfully"})
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Default to port 5000 if PORT is not set
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
